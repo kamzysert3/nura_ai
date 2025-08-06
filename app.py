@@ -167,13 +167,10 @@ async def chat(request: ChatRequest):
 
     return ChatResponse(thread_id=thread_id, response=response)
 
+@app.get("/")
+async def health_check():
+    return {"status": "healthy"}
 
-from pyngrok import ngrok
 import uvicorn
-
-ngrok.set_auth_token("2lF5wXiCnwiL7Gw02aZYf670KtN_6cgH5KX53byFqAiJbH7e6")
-public_url = ngrok.connect(8000)
-print(f"Public URL: {public_url}")
-
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
