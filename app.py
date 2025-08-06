@@ -14,6 +14,7 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_google_genai import ChatGoogleGenerativeAI
+from fastapi.middleware.cors import CORSMiddleware
 
 # Apply nest_asyncio patch
 nest_asyncio.apply()
@@ -118,6 +119,16 @@ tools = [classify_specialty, find_doctors, process_document]
 
 # Initialize FastAPI
 app = FastAPI(title="Nura Assistant API")
+
+# Allow CORS from any origin (for development)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # Shared memory per thread (simulate per-user thread using thread_id)
 thread_memories = {}
