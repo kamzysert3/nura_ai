@@ -151,8 +151,13 @@ async def chat(request: ChatRequest):
 
     # Load or create memory saver
     if thread_id not in thread_memories:
-        # thread_memories[thread_id] = MongoDBSaver.from_conn_string(MONGODB_URI)
-        thread_memories[thread_id] = MemorySaver()
+        client = pymongo.MongoClient(MONGODB_URI)
+        thread_memories[thread_id] = MongoDBSaver(
+            client=client,               
+            database="nura_ai",          
+            collection="conversations",  
+            namespace=thread_id          
+        )
 
     memory = thread_memories[thread_id]
 
