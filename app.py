@@ -70,21 +70,39 @@ def classify_specialty(complaint: str) -> str:
 @tool(
     name_or_callable="find_doctors",
     description=(
-        "Given a medical specialty (e.g. 'Dermatologist'), return up to 5 "
-        "doctors from MongoDB matching that specialty as a markdown list."
+        "Search for doctors by various criteria such as name, specialty, hospital, or licenseID. "
+        "Returns up to 5 matches as a markdown list."
     )
 )
-def find_doctors(specialty: str) -> str:
+def find_doctors(
+    name: str = None,
+    specialty: str = None,
+    hospital: str = None,
+    licenseID: str = None
+) -> str:
     client = pymongo.MongoClient(MONGODB_URI)
     col = client["test"]["doctors"]
+    query = {}
+    if name:
+        query["name"] = {"$regex": name, "$options": "i"}
+    if specialty:
+        query["specialty"] = {"$regex": specialty, "$options": "i"}
+    if hospital:
+        query["hospital"] = {"$regex": hospital, "$options": "i"}
+    if licenseID:
+        query["licenseID"] = {"$regex": licenseID, "$options": "i"}
+
     cursor = col.find(
-        {"specialty": {"$regex": specialty, "$options": "i"}},
+        query,
         {"_id": 0, "uid": 1, "name": 1, "hospital": 1, "licenseID": 1, "email": 1, "phone": 1}
     ).limit(5)
     docs = list(cursor)
     client.close()
     if not docs:
-        return f"No doctors found for specialty '{specialty}'."
+        if query:
+            return f"No doctors found matching criteria: {query}."
+        else:
+            return "No doctors found in the database."
 
     lines = []
     for d in docs:
