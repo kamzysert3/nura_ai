@@ -9,3 +9,4 @@ langchain-google-genai
 langgraph
 langgraph-checkpoint-mongodb
 pyngrok
+google-generativeai

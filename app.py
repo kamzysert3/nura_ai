@@ -2,17 +2,18 @@ import os
 import uuid
 import pymongo
 import nest_asyncio
-import asyncio
-from fastapi import FastAPI, Request
+import mimetypes
+import tempfile
+
+from fastapi import FastAPI, File, UploadFile, Form
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Optional
 
-from langchain_community.document_loaders import PyPDFLoader
+import google.generativeai as genai
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.mongodb import MongoDBSaver
-from langgraph.checkpoint.memory import MemorySaver
 from langchain_google_genai import ChatGoogleGenerativeAI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -25,17 +26,20 @@ load_dotenv()
 # Get API keys
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 MONGODB_URI = os.getenv("MONGO_URI")
+NGROK_TOKEN = os.getenv("NGROK_TOKEN")
 
-# Check for missing API keys
-if not GOOGLE_API_KEY or not MONGODB_URI:
-    raise EnvironmentError("Missing GOOGLE_API_KEY or MONGO_URI in .env")
+if not GOOGLE_API_KEY or not MONGODB_URI or not NGROK_TOKEN:
+    raise EnvironmentError("Missing Variables in .env")
 
 
 chat_llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash",
+    model="gemini-2.5-flash",
     temperature=0.7,
     google_api_key=GOOGLE_API_KEY
 )
+
+genai.configure(api_key=GOOGLE_API_KEY)
+file_llm = genai.GenerativeModel("gemini-2.5-flash")
 
 # Define system prompt template
 system_prompt_template = """
@@ -96,7 +100,7 @@ def classify_specialty(complaint: str) -> str:
 @tool(
     name_or_callable="find_doctors",
     description=(
-        "Search for doctors by various criteria such as name, specialty, hospital, or licenseID or even none. "
+        "Search for doctors by various criteria such as name, specialty, hospital, or licenseID. "
         "Returns up to 5 matches as a markdown list."
     )
 )
@@ -142,22 +146,6 @@ def find_doctors(
         )
     return "\n".join(lines)
 
-# @tool(
-#     name_or_callable="process_document",
-#     description=(
-#         "Given an instruction and the text of a document separated by '||',"
-#         " perform the instruction on the document. Input format: '<instruction>||<document_text>'."
-#     )
-# )
-# def process_document(input_str: str) -> str:
-#     instruction, doc = input_str.split('||',1)
-#     prompt = (
-#         "You are a document assistant. Follow the instruction on the document."
-#         f"\nInstruction: {instruction}\n\nDocument:\n{doc}"
-#     )
-#     resp = chat_llm.invoke([("user", prompt)])
-#     return resp["messages"][-1][1].strip()
-
 # Populate tools list
 tools = [classify_specialty, find_doctors]
 
@@ -179,9 +167,9 @@ thread_memories = {}
 
 # Data models
 class ChatRequest(BaseModel):
-    thread_id: Optional[str] = None
-    message: str
-    document_text: Optional[str] = None
+    message: Optional[str] = Form(None),
+    thread_id: Optional[str] = Form(None),
+    document_file: Optional[UploadFile] = File(None)
 
 class ChatResponse(BaseModel):
     thread_id: str
@@ -192,15 +180,16 @@ agent_cache = {}
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     thread_id = request.thread_id or str(uuid.uuid4())
+    user_input = request.message or ""
 
     # Load or create memory saver
     if thread_id not in thread_memories:
         client = pymongo.MongoClient(MONGODB_URI)
         thread_memories[thread_id] = MongoDBSaver(
-            client=client,               
-            database="nura_ai",          
-            collection="conversations",  
-            namespace=thread_id          
+            client=client,
+            database="nura_ai",
+            collection="conversations",
+            namespace=thread_id
         )
 
     memory = thread_memories[thread_id]
@@ -216,13 +205,48 @@ async def chat(request: ChatRequest):
 
     agent = agent_cache[thread_id]
 
-    user_input = request.message
-    if request.document_text:
-        user_input += f"||{request.document_text}"
+    # If there's a document
+    if request.document_file:
+
+        suffix = os.path.splitext(request.document_file.filename)[1] or ""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            file_bytes = await request.document_file.read()
+            tmp.write(file_bytes)
+            temp_path = tmp.name
+
+        mime_type, _ = mimetypes.guess_type(request.document_file.filename)
+        mime_type = mime_type or "application/octet-stream"
+
+        # Upload file to Gemini
+        file_ref = genai.upload_file(temp_path, mime_type=mime_type)
+
+        # Construct prompt for Gemini
+        prompt_text = f"""
+          SYSTEM: You are Nura, a HIPAA-compliant clinical assistant. Follow these rules:
+          - Be concise and factual. When unsure, say "unclear" rather than inventing facts.
+          - Output two sections only: "analysis" (human-friendly) and "plan" (machine-friendly JSON). Do not include any other free text outside these two sections.
+
+          TASK: The user uploaded a file. Read the file and the user's question below, then:
+          1) Produce a concise patient-facing summary (under 150 words). Put that under "analysis".
+          2) List up to 5 clinical findings or important facts (bulleted) under "analysis".
+          3) Identify any red flags that require urgent care (if any) under "analysis".
+          4) Produce a machine-readable JSON object named "plan" following the EXACT schema given below. The JSON must be valid and appear by itself (no code fences).
+
+          USER QUESTION: {user_input}
+        """
+        gemini_response = file_llm.generate_content([prompt_text, file_ref])
+        file_analysis = gemini_response.text
+
+        # Remove temp file
+        os.remove(temp_path)
+
+        # Now pass the combined text to your agent for further processing
+        user_input_for_agent = f"{file_analysis}\n\nUser question: {user_input}"
+    else:
+        user_input_for_agent = user_input
 
     config = {"configurable": {"thread_id": thread_id}}
-
-    result = agent.invoke({"messages": [("user", user_input)]}, config)
+    result = agent.invoke({"messages": [("user", user_input_for_agent)]}, config)
     response = result["messages"][-1].content
 
     return ChatResponse(thread_id=thread_id, response=response)
