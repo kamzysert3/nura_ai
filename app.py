@@ -2,7 +2,6 @@ import os
 import uuid
 import pymongo
 import nest_asyncio
-import mimetypes
 import tempfile
 
 from fastapi import FastAPI, File, UploadFile, Form
@@ -214,8 +213,7 @@ async def chat(request: ChatRequest):
             tmp.write(file_bytes)
             temp_path = tmp.name
 
-        mime_type, _ = mimetypes.guess_type(request.document_file.filename)
-        mime_type = mime_type or "application/octet-stream"
+        mime_type = request.document_file.content_type
 
         # Upload file to Gemini
         file_ref = genai.upload_file(temp_path, mime_type=mime_type)
