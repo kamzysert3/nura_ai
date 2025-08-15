@@ -248,6 +248,41 @@ async def chat(
 
     return ChatResponse(thread_id=thread_id, response=response)
 
+@app.post("/transcribe")
+async def transcribe(
+    audio: UploadFile = File(None)
+):
+    suffix = os.path.splitext(audio.filename)[1] or ""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        file_bytes = await audio.read()
+        tmp.write(file_bytes)
+        temp_path = tmp.name
+
+    mime_type = audio.content_type
+
+    # Upload file to Gemini
+    file_ref = genai.upload_file(temp_path, mime_type=mime_type)
+
+    # Construct prompt for Gemini
+    prompt_text = """
+        You are an AI transcription assistant. 
+
+        Your task:
+        1. Listen to the uploaded audio file carefully.
+        2. Transcribe all spoken content into English.
+        3. Correct obvious grammar mistakes and add punctuation.
+        4. Remove filler words like "um", "uh", "you know" unless important for meaning.
+        7. Output as clean paragraphs for general readability.
+    """
+
+    gemini_response = file_llm.generate_content([prompt_text, file_ref])
+    file_analysis = gemini_response.text
+
+    # Remove temp file
+    os.remove(temp_path)
+
+    return {"transcription": file_analysis}
+
 @app.get("/")
 async def health_check():
     return {"status": "healthy"}
