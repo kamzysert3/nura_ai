@@ -10,3 +10,4 @@ langgraph
 langgraph-checkpoint-mongodb
 pyngrok
 google-generativeai
+python-multipart
