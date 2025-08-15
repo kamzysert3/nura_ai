@@ -165,11 +165,6 @@ app.add_middleware(
 thread_memories = {}
 
 # Data models
-class ChatRequest(BaseModel):
-    message: Optional[str] = Form(None),
-    thread_id: Optional[str] = Form(None),
-    document_file: Optional[UploadFile] = File(None)
-
 class ChatResponse(BaseModel):
     thread_id: str
     response: str
@@ -177,9 +172,13 @@ class ChatResponse(BaseModel):
 agent_cache = {}
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    thread_id = request.thread_id or str(uuid.uuid4())
-    user_input = request.message or ""
+async def chat(
+    message: Optional[str] = Form(None),
+    thread_id: Optional[str] = Form(None),
+    document_file: Optional[UploadFile] = File(None)
+):
+    thread_id = thread_id or str(uuid.uuid4())
+    user_input = message or ""
 
     # Load or create memory saver
     if thread_id not in thread_memories:
@@ -205,15 +204,15 @@ async def chat(request: ChatRequest):
     agent = agent_cache[thread_id]
 
     # If there's a document
-    if request.document_file:
+    if document_file:
 
-        suffix = os.path.splitext(request.document_file.filename)[1] or ""
+        suffix = os.path.splitext(document_file.filename)[1] or ""
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            file_bytes = await request.document_file.read()
+            file_bytes = await document_file.read()
             tmp.write(file_bytes)
             temp_path = tmp.name
 
-        mime_type = request.document_file.content_type
+        mime_type = document_file.content_type
 
         # Upload file to Gemini
         file_ref = genai.upload_file(temp_path, mime_type=mime_type)
