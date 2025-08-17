@@ -15,6 +15,9 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from langchain_google_genai import ChatGoogleGenerativeAI
 from fastapi.middleware.cors import CORSMiddleware
+from langchain_core.messages import AIMessage
+from langmem.short_term import SummarizationNode, RunningSummary
+from langgraph.prebuilt.chat_agent_executor import AgentState
 
 # Apply nest_asyncio patch
 nest_asyncio.apply()
@@ -39,6 +42,77 @@ chat_llm = ChatGoogleGenerativeAI(
 
 genai.configure(api_key=GOOGLE_API_KEY)
 file_llm = genai.GenerativeModel("gemini-2.5-flash")
+
+class GeminiWrapper:
+    def __init__(self, model):
+        self.model = model
+
+    def _stringify_content(self, msg):
+        if isinstance(msg, str):
+            return msg.strip()
+        if isinstance(msg, list):
+            parts = []
+            for c in msg:
+                if isinstance(c, dict) and "text" in c:
+                    parts.append(c["text"])
+                else:
+                    parts.append(str(c))
+            return " ".join(parts).strip()
+        return str(msg).strip()
+
+    def invoke(self, messages, **kwargs):
+        text_parts = []
+        for m in messages:
+            if hasattr(m, "content"):
+                text_parts.append(self._stringify_content(m.content))
+            else:
+                text_parts.append(self._stringify_content(m))
+        text = " ".join([p for p in text_parts if p])
+
+        response = self.model.generate_content(text)
+
+        return AIMessage(content=response.text)
+
+summarize_llm = GeminiWrapper(genai.GenerativeModel("gemini-2.5-flash"))
+
+def stringify_content(msg):
+    """Normalize message content into a string for token counting."""
+    if isinstance(msg.content, str):
+        return msg.content.strip()
+    if isinstance(msg.content, list):
+        parts = []
+        for c in msg.content:
+            if isinstance(c, dict) and "text" in c:
+                parts.append(c["text"])
+            else:
+                parts.append(str(c))
+        return " ".join(parts).strip()
+    return str(msg.content).strip()
+
+def gemini_token_counter(msgs):
+    """Token counter for SummarizationNode that is Gemini-safe."""
+    text = " ".join([stringify_content(m) for m in msgs if stringify_content(m)])
+    if not text:
+        return 0
+    try:
+        return file_llm.count_tokens(text).total_tokens
+    except Exception:
+        # Fallback: rough estimate (1 token ~ 4 chars)
+        return len(text) // 4
+
+summarization_node = SummarizationNode(
+    token_counter=gemini_token_counter,
+    model=summarize_llm,
+    max_tokens=82_768,
+    max_tokens_before_summary=24_576,
+    max_summary_tokens=4_096,
+    output_messages_key="llm_input_messages",
+)
+
+class State(AgentState):
+    # NOTE: we're adding this key to keep track of previous summary information
+    # to make sure we're not summarizing on every LLM call
+    context: dict[str, RunningSummary]
 
 # Define system prompt template
 system_prompt_template = """
@@ -99,8 +173,20 @@ def classify_specialty(complaint: str) -> str:
 @tool(
     name_or_callable="find_doctors",
     description=(
-        "Search for doctors by various criteria such as name, specialty, hospital, or licenseID. "
-        "Returns up to 5 matches as a markdown list."
+        """
+        Search for doctors using one or more of these criteria:
+        - name (e.g. "Dr. Peter")
+        - specialty (e.g. "Neurologist")
+        - hospital (e.g. "General Hospital")
+        - licenseID (e.g. "ABC12345")
+
+        You don't need all criteria — use whichever fits the user's request.
+        Examples:
+        - "I need to see Dr. Peter" => name: Peter
+        - "A doctor for my head trauma" => specialty: Neurologist
+        - "Can you suggest any doctor that works in the General Hospital?" => hospital: General Hospital
+        - "Find the doctor with license ID 12345" => licenseID: 12345
+        """
     )
 )
 def find_doctors(
@@ -197,6 +283,8 @@ async def chat(
         agent_cache[thread_id] = create_react_agent(
             model=chat_llm,
             tools=tools,
+            pre_model_hook=summarization_node,
+            state_schema=State,
             prompt=system_prompt_template,
             checkpointer=memory,
         )
@@ -219,17 +307,24 @@ async def chat(
 
         # Construct prompt for Gemini
         prompt_text = f"""
-          SYSTEM: You are Nura, a HIPAA-compliant clinical assistant. Follow these rules:
-          - Be concise and factual. When unsure, say "unclear" rather than inventing facts.
-          - Output two sections only: "analysis" (human-friendly) and "plan" (machine-friendly JSON). Do not include any other free text outside these two sections.
+            You are a document analysis AI that works as a preprocessing step for a text-only healthcare assistant named Nura.
 
-          TASK: The user uploaded a file. Read the file and the user's question below, then:
-          1) Produce a concise patient-facing summary (under 150 words). Put that under "analysis".
-          2) List up to 5 clinical findings or important facts (bulleted) under "analysis".
-          3) Identify any red flags that require urgent care (if any) under "analysis".
-          4) Produce a machine-readable JSON object named "plan" following the EXACT schema given below. The JSON must be valid and appear by itself (no code fences).
+            TASK:
+            1. Read the uploaded document thoroughly.
+            2. Identify and extract ALL medically relevant information that could help fulfill the user's instructions below.
+            3. Include as much necessary detail as possible — do not summarize unless details are irrelevant to the request.
+            4. Preserve medical terminology from the document, but clarify meaning in parentheses when possible.
+            5. DO NOT provide any conversational output or recommendations.
+            6. DO NOT address the user directly — this is an internal data package for Nura.
 
-          USER QUESTION: {user_input}
+            USER_INSTRUCTIONS: {user_input}
+
+            OUTPUT FORMAT:
+            DOCUMENT_ANALYSIS:
+            [Write a detailed, structured description of the relevant information from the document here. Use headings, bullet points, or numbered lists as needed.]
+
+            If the document contains no relevant details for the request, output:
+            DOCUMENT_ANALYSIS: No relevant information found.
         """
         gemini_response = file_llm.generate_content([prompt_text, file_ref])
         file_analysis = gemini_response.text
