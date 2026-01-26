@@ -1,3 +1,4 @@
+import datetime
 import os
 import uuid
 import pymongo
@@ -151,26 +152,6 @@ mechanics.
 """
 
 @tool(
-    name_or_callable="classify_specialty",
-    description=(
-        "Takes a free-text patient complaint (e.g. 'I have rashes on my arm') "
-        "and returns exactly one medical specialty (e.g. 'Dermatologist')."
-    )
-)
-def classify_specialty(complaint: str) -> str:
-    prompt = (
-        "You are an expert medical router. Given a patient's complaint, output the exact "
-        "specialist (e.g., 'Dermatologist', 'Cardiologist') they should see. Just give one word or phrase.\n\n"
-        "Examples:\n"
-        "Complaint: 'I have chest pain.'\nSpecialist: Cardiologist\n"
-        "Complaint: 'My skin is itchy and flaky.'\nSpecialist: Dermatologist\n"
-        "Complaint: 'I have persistent heartburn.'\nSpecialist: Gastroenterologist\n\n"
-        f"Complaint: '{complaint}'\nSpecialist:"
-    )
-
-    return chat_llm.invoke([("user", prompt)])
-
-@tool(
     name_or_callable="find_doctors",
     description=(
         """
@@ -231,8 +212,156 @@ def find_doctors(
         )
     return "\n".join(lines)
 
+@tool(
+    name_or_callable="get_info",
+    description=(
+        """
+        Use this tool when you need to infer details about a user information
+        (e.g., profile info, preferences, or activity) tied to a specific thread.
+
+        Input: A thread_id (string or integer).
+        Output: User data object containing the relevant information.
+        """
+    )
+)
+def get_info(thread_id: str) -> str:
+    client = pymongo.MongoClient(MONGODB_URI)
+    col1 = client["test"]["doctors"]
+    col2 = client["test"]["patients"]
+
+    cursor = col1.find(
+        { "_id": thread_id },
+        {"_id": 1, "name": 1, "hospital": 1, "licenseID": 1, "email": 1, "phone": 1, "specialty": 1}
+    )
+    docs = list(cursor)
+    if docs:
+        client.close()
+        lines = []
+        for d in docs:
+            contact = []
+            if d.get('email'): contact.append(d['email'])
+            if d.get('phone'): contact.append(str(d['phone']))
+            contact_info = ", ".join(contact) if contact else 'no contact info'
+            lines.append(
+                f"- **{d.get('name','Unknown')}** at {d.get('hospital','Unknown Hospital')} "
+                f"Specialty: {d.get('specialty', 'None')}"
+                f"(License: {d.get('licenseID','N/A')}) — {contact_info}"
+            )
+        return "\n".join(lines)
+    else:
+        cursor = col2.find(
+            { "_id": thread_id },
+            {"_id": 0, "name": 1, "age": 1, "email": 1, "phone": 1, "DOB": 1}
+        )
+        docs = list(cursor)
+        if docs:
+            client.close()
+            lines = []
+            for d in docs:
+                contact = []
+                if d.get('email'): contact.append(d['email'])
+                if d.get('phone'): contact.append(str(d['phone']))
+                contact_info = ", ".join(contact) if contact else 'no contact info'
+                lines.append(
+                    f"- **{d.get('name','Unknown')}**"
+                    f"{d.get('age','Unknown')} Years Old"
+                    f"Born on {d.get('DOB','Unknown')}"
+                    f" — {contact_info}"
+                )
+            return "\n".join(lines)
+        else:
+            client.close()
+            return f"No user data found for thread_id: {thread_id}."
+
+@tool(
+    name_or_callable="get_appointment_info",
+    description=(
+        """
+        Retrieves detailed information about an appointment linked to a specific thread_id. 
+        This may include past, current, and upcoming appointments.
+
+        Expected input:
+            - thread_id (str): Unique identifier of the conversation or session 
+              where the appointment was gotten from internal processing.
+
+        Returns:
+            - dict: A structured object containing appointment details such as 
+              date, time, status, participants, and other relevant metadata.
+        """
+    )
+)
+def get_appointment_info(thread_id: str) -> dict | list[dict]:
+    client = pymongo.MongoClient(MONGODB_URI)
+    col = client["test"]["appointments"]
+
+    now = datetime.datetime.now(datetime.UTC)
+
+    pipeline = [
+        {
+            "$match": {
+                "$or": [
+                    {"doctor": thread_id},
+                    {"patient": thread_id}
+                ]
+            }
+        },
+        # Lookup doctor info from doctors collection
+        {
+            "$lookup": {
+                "from": "doctors",
+                "localField": "doctor",
+                "foreignField": "_id",
+                "as": "doctor_info"
+            }
+        },
+        {"$unwind": {"path": "$doctor_info", "preserveNullAndEmptyArrays": True}},
+
+        # Lookup patient info from patients collection
+        {
+            "$lookup": {
+                "from": "patients",
+                "localField": "patient",
+                "foreignField": "_id",
+                "as": "patient_info"
+            }
+        },
+        {"$unwind": {"path": "$patient_info", "preserveNullAndEmptyArrays": True}},
+
+        # Project final structure
+        {
+            "$project": {
+                "_id": 0,
+                "doctor": "$doctor_info",
+                "patient": "$patient_info",
+                "date": 1,
+                "start": 1,
+                "finish": 1,
+                "details": 1,
+                "type": 1,
+                "status": 1
+            }
+        },
+        {"$sort": {"date": 1}}
+    ]
+
+    appointments = list(col.aggregate(pipeline))
+    client.close()
+
+    if not appointments:
+        return "No appointment found for this user"
+
+    for appt in appointments:
+        if isinstance(appt.get("date"), datetime.datetime):
+            appt["date"] = appt["date"].isoformat()
+        if appt.get("date") > now.isoformat():
+            appt["time_period"] = "upcoming"
+        else:
+            appt["time_period"] = "past"
+
+    return appointments if len(appointments) > 1 else appointments[0]
+
 # Populate tools list
-tools = [classify_specialty, find_doctors]
+tools = [find_doctors, get_info, get_appointment_info]
 
 # Initialize FastAPI
 app = FastAPI(title="Nura Assistant API")
@@ -333,9 +462,21 @@ async def chat(
         os.remove(temp_path)
 
         # Now pass the combined text to your agent for further processing
-        user_input_for_agent = f"{file_analysis}\n\nUser question: {user_input}"
+        user_input_for_agent = f"""
+          USER_ID: {thread_id}
+
+          {file_analysis}
+          
+          USER_INPUT: 
+          {user_input}
+        """
     else:
-        user_input_for_agent = user_input
+        user_input_for_agent = f"""
+          USER_ID: {thread_id}
+
+          USER_INPUT:
+          {user_input}
+        """
 
     config = {"configurable": {"thread_id": thread_id}}
     result = agent.invoke({"messages": [("user", user_input_for_agent)]}, config)
