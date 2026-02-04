@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Optional
 
-import google.generativeai as genai
+import google.genai as genai
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.mongodb import MongoDBSaver
@@ -480,7 +480,8 @@ async def chat(
 
     config = {"configurable": {"thread_id": thread_id}}
     result = agent.invoke({"messages": [("user", user_input_for_agent)]}, config)
-    response = result["messages"][-1].content
+    raw = result["messages"][-1]
+    response = stringify_content(raw)
 
     return ChatResponse(thread_id=thread_id, response=response)
 
