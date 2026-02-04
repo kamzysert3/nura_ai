@@ -9,6 +9,6 @@ langchain-google-genai
 langgraph
 langgraph-checkpoint-mongodb
 pyngrok
-google-genai
+google-generativeai
 python-multipart
 langmem

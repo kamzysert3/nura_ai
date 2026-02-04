@@ -10,7 +10,8 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Optional
 
-import google.genai as genai
+from google import genai
+from google.genai import types
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.mongodb import MongoDBSaver
@@ -41,12 +42,13 @@ chat_llm = ChatGoogleGenerativeAI(
     google_api_key=GOOGLE_API_KEY
 )
 
-genai.configure(api_key=GOOGLE_API_KEY)
-file_llm = genai.GenerativeModel("gemini-2.5-flash")
+# Initialize the client
+client = genai.Client(api_key=GOOGLE_API_KEY)
 
 class GeminiWrapper:
-    def __init__(self, model):
-        self.model = model
+    def __init__(self, client, model_name="gemini-2.5-flash"):
+        self.client = client
+        self.model_name = model_name
 
     def _stringify_content(self, msg):
         if isinstance(msg, str):
@@ -70,11 +72,22 @@ class GeminiWrapper:
                 text_parts.append(self._stringify_content(m))
         text = " ".join([p for p in text_parts if p])
 
-        response = self.model.generate_content(text)
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=text
+        )
 
         return AIMessage(content=response.text)
 
-summarize_llm = GeminiWrapper(genai.GenerativeModel("gemini-2.5-flash"))
+    def count_tokens(self, text):
+        """Count tokens for the given text."""
+        result = self.client.models.count_tokens(
+            model=self.model_name,
+            contents=text
+        )
+        return result.total_tokens
+
+summarize_llm = GeminiWrapper(client, "gemini-2.5-flash")
 
 def stringify_content(msg):
     """Normalize message content into a string for token counting."""
@@ -96,7 +109,7 @@ def gemini_token_counter(msgs):
     if not text:
         return 0
     try:
-        return file_llm.count_tokens(text).total_tokens
+        return summarize_llm.count_tokens(text)
     except Exception:
         # Fallback: rough estimate (1 token ~ 4 chars)
         return len(text) // 4
@@ -397,9 +410,9 @@ async def chat(
 
     # Load or create memory saver
     if thread_id not in thread_memories:
-        client = pymongo.MongoClient(MONGODB_URI)
+        mongo_client = pymongo.MongoClient(MONGODB_URI)
         thread_memories[thread_id] = MongoDBSaver(
-            client=client,
+            client=mongo_client,
             database="nura_ai",
             collection="conversations",
             namespace=thread_id
@@ -431,8 +444,8 @@ async def chat(
 
         mime_type = document_file.content_type
 
-        # Upload file to Gemini
-        file_ref = genai.upload_file(temp_path, mime_type=mime_type)
+        # Upload file to Gemini using new API
+        file_ref = client.files.upload(path=temp_path)
 
         # Construct prompt for Gemini
         prompt_text = f"""
@@ -455,7 +468,14 @@ async def chat(
             If the document contains no relevant details for the request, output:
             DOCUMENT_ANALYSIS: No relevant information found.
         """
-        gemini_response = file_llm.generate_content([prompt_text, file_ref])
+        
+        gemini_response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Part.from_text(prompt_text),
+                types.Part.from_uri(file_uri=file_ref.uri, mime_type=mime_type)
+            ]
+        )
         file_analysis = gemini_response.text
 
         # Remove temp file
@@ -497,8 +517,8 @@ async def transcribe(
 
     mime_type = audio.content_type
 
-    # Upload file to Gemini
-    file_ref = genai.upload_file(temp_path, mime_type=mime_type)
+    # Upload file to Gemini using new API
+    file_ref = client.files.upload(path=temp_path)
 
     # Construct prompt for Gemini
     prompt_text = """
@@ -512,7 +532,13 @@ async def transcribe(
         7. Output as clean paragraphs for general readability.
     """
 
-    gemini_response = file_llm.generate_content([prompt_text, file_ref])
+    gemini_response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            types.Part.from_text(prompt_text),
+            types.Part.from_uri(file_uri=file_ref.uri, mime_type=mime_type)
+        ]
+    )
     file_analysis = gemini_response.text
 
     # Remove temp file
@@ -527,3 +553,4 @@ async def health_check():
 import uvicorn
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    
